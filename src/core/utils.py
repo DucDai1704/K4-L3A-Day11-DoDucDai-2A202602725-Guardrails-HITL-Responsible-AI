@@ -44,13 +44,44 @@ async def chat_with_agent(agent, runner, user_message: str, session_id=None):
         parts=[types.Part.from_text(text=user_message)],
     )
 
-    final_response = ""
-    async for event in runner.run_async(
-        user_id=user_id, session_id=session.id, new_message=content
-    ):
-        if hasattr(event, "content") and event.content and event.content.parts:
-            for part in event.content.parts:
-                if hasattr(part, "text") and part.text:
-                    final_response += part.text
+    # Check input plugins before calling model to prevent quota waste on blocked inputs
+    plugins = getattr(runner, "plugins", None)
+    if not plugins and hasattr(runner, "plugin_manager"):
+        plugins = getattr(runner.plugin_manager, "plugins", []) or []
+    for plugin in plugins:
+        cb = getattr(plugin, "on_user_message_callback", None)
+        if cb:
+            class _Ctx:
+                user_id = "student"
+            import inspect
+            if inspect.iscoroutinefunction(cb):
+                res = await cb(invocation_context=_Ctx(), user_message=content)
+            else:
+                res = cb(invocation_context=_Ctx(), user_message=content)
+            if res is not None:
+                text = ""
+                if hasattr(res, "parts") and res.parts:
+                    for p in res.parts:
+                        if hasattr(p, "text") and p.text:
+                            text += p.text
+                return text or "I cannot process that request. I only help with VinBank banking questions.", None
 
-    return final_response, session
+    import asyncio
+
+    for attempt in range(3):
+        try:
+            final_response = ""
+            async for event in runner.run_async(
+                user_id=user_id, session_id=session.id, new_message=content
+            ):
+                if hasattr(event, "content") and event.content and event.content.parts:
+                    for part in event.content.parts:
+                        if hasattr(part, "text") and part.text:
+                            final_response += part.text
+            return final_response, session
+        except Exception as e:
+            err_msg = str(e)
+            if attempt < 2 and any(code in err_msg for code in ("503", "429", "UNAVAILABLE", "ResourceExhausted", "high demand")):
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            raise
